@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::digest::TreeDigestParseError;
 use crate::names::{Host, NameError, NamespaceError, RelativePathError};
+use crate::package::BatteryTarget;
 
 /// The only manifest schema this build reads.
 pub const SCHEMA: u32 = 1;
@@ -78,6 +79,12 @@ pub enum ManifestError {
         second: String,
         shared: String,
     },
+    #[error("{path}: `battery.targets.{target}` is not a target: a target is `single-user` or `multi-user`")]
+    Target { path: PathBuf, target: String },
+    #[error(
+        "{path}: `[battery.targets]` declares some targets but not `{missing}`: a battery declares every target or none"
+    )]
+    PartialTargets { path: PathBuf, missing: BatteryTarget },
     #[error("{path} declares neither `[battery]` nor `[plugin]`")]
     NoRole { path: PathBuf },
     #[error("{path} declares both `[battery]` and `[plugin]`")]
