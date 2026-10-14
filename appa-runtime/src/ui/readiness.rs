@@ -90,8 +90,15 @@ pub(super) fn executable_available(executable: &str) -> bool {
 }
 
 /// Ready means nothing the battery declares is missing: its executables, the values of the
-/// variables its policy binds as `token_env`, and, when it declares a check, the check's verdict.
-pub(super) async fn check(dir: &Path, battery: &appa_package::Battery, store: &CredentialStore) -> CheckResult {
+/// variables its policies bind as `token_env` for a deployment of `target`, and, when it
+/// declares a check, the check's verdict.
+pub(super) async fn check(
+    dir: &Path,
+    battery: &appa_package::Battery,
+    target: appa_package::BatteryTarget,
+    store: &CredentialStore,
+) -> CheckResult {
+    let credentials = battery.credentials_for(target);
     let readiness = battery.readiness.as_ref();
     if readiness
         .into_iter()
@@ -101,10 +108,10 @@ pub(super) async fn check(dir: &Path, battery: &appa_package::Battery, store: &C
         return CheckResult::new(Status::NeedsConfiguration, Reason::MissingExecutable);
     }
     let mut environment = BTreeMap::new();
-    for variable in &battery.credentials {
+    for &variable in &credentials {
         match resolve(Some(store), variable) {
             Ok(Some(value)) if !value.is_empty() => {
-                environment.insert(variable.clone(), value);
+                environment.insert(variable.to_owned(), value);
             }
             Ok(_) => (),
             Err(_) => return CheckResult::new(Status::Unavailable, Reason::CheckFailed),
@@ -112,7 +119,7 @@ pub(super) async fn check(dir: &Path, battery: &appa_package::Battery, store: &C
     }
     let Some(readiness) = readiness.filter(|r| !r.command.is_empty()) else {
         // Without a check, only presence is knowable: a set variable is not a verified one.
-        return if environment.len() == battery.credentials.len() {
+        return if environment.len() == credentials.len() {
             CheckResult::new(Status::Ready, Reason::Configured)
         } else {
             CheckResult::new(Status::NeedsConfiguration, Reason::MissingCredential)

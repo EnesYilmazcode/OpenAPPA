@@ -190,6 +190,22 @@ impl Battery {
             None => vec![&self.base],
         }
     }
+
+    /// The variables a deployment of `target` reads: its target policy's, then the
+    /// base's, each once.
+    pub fn credentials_for(&self, target: BatteryTarget) -> Vec<&str> {
+        let target_credentials = match &self.targets {
+            Some(targets) => &targets.get(target).credentials[..],
+            None => &[][..],
+        };
+        let mut credentials: Vec<&str> = Vec::new();
+        for variable in target_credentials.iter().chain(&self.credentials) {
+            if !credentials.contains(&variable.as_str()) {
+                credentials.push(variable);
+            }
+        }
+        credentials
+    }
 }
 
 /// Optional, bounded, read-only battery authentication check.
@@ -709,6 +725,33 @@ mod tests {
             names(plain.battery().unwrap().compose_order(BatteryTarget::SingleUser)),
             vec!["appa.toml"]
         );
+    }
+
+    #[test]
+    fn credentials_for_reads_the_target_policy_and_the_base_once_each() {
+        let mut targeted = manifest(TARGETED).unwrap().battery().unwrap().clone();
+        targeted.credentials = vec!["APPA_PROVIDER_A".into(), "APPA_PROVIDER_B".into()];
+        targeted
+            .targets
+            .as_mut()
+            .unwrap()
+            .get_mut(BatteryTarget::MultiUser)
+            .credentials = vec!["APPA_PROVIDER_C".into(), "APPA_PROVIDER_A".into()];
+
+        assert_eq!(
+            targeted.credentials_for(BatteryTarget::MultiUser),
+            vec!["APPA_PROVIDER_C", "APPA_PROVIDER_A", "APPA_PROVIDER_B"]
+        );
+        assert_eq!(
+            targeted.credentials_for(BatteryTarget::SingleUser),
+            vec!["APPA_PROVIDER_A", "APPA_PROVIDER_B"]
+        );
+
+        let mut plain = manifest(BATTERY).unwrap().battery().unwrap().clone();
+        plain.credentials = vec!["APPA_PROVIDER_A".into()];
+        for target in BatteryTarget::ALL {
+            assert_eq!(plain.credentials_for(target), vec!["APPA_PROVIDER_A"]);
+        }
     }
 
     #[test]
