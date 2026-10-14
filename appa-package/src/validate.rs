@@ -219,15 +219,36 @@ pub fn validate_package(dir: &Path) -> Result<Package, PackageError> {
             }
             battery.audiences = base.audiences;
             battery.credentials = base.credentials;
+            let runs_a_helper = |command: &[String]| {
+                runs_a_declared_helper(
+                    &command.iter().map(String::as_str).collect::<Vec<_>>(),
+                    &battery.helpers,
+                )
+            };
+            let target_commands: Vec<&[String]> = battery
+                .targets
+                .iter()
+                .flat_map(|targets| {
+                    targets
+                        .iter()
+                        .filter_map(|(_, target_policy)| target_policy.readiness.as_deref())
+                })
+                .filter(|command| !command.is_empty())
+                .collect();
+            let readiness_error = |policy: PathBuf| {
+                PackageError::Readiness { policy, reason: "a check runs python3 on a declared helper and requires python3; a target policy's check needs the base's [battery.readiness]; executables are bare names; alternatives reference owned credentials".into() }
+            };
+            if battery.readiness.is_none() && !target_commands.is_empty() {
+                return Err(readiness_error(policy));
+            }
             if let Some(check) = &battery.readiness {
                 let executable = |name: &str| {
                     !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
                 };
-                let valid = (check.command.is_empty()
-                    || (check.command.len() == 2
-                        && check.command[0] == "python3"
-                        && battery.helpers.iter().any(|helper| helper.as_str() == check.command[1])))
-                    && (check.command.is_empty() || check.required_executables.iter().any(|name| name == "python3"))
+                let runs_python = !check.command.is_empty() || !target_commands.is_empty();
+                let valid = (check.command.is_empty() || runs_a_helper(&check.command))
+                    && target_commands.iter().all(|command| runs_a_helper(command))
+                    && (!runs_python || check.required_executables.iter().any(|name| name == "python3"))
                     && check.required_executables.iter().all(|name| executable(name))
                     && check.cli_alternatives.iter().all(|alt| {
                         executable(&alt.executable)
@@ -242,7 +263,7 @@ pub fn validate_package(dir: &Path) -> Result<Package, PackageError> {
                             && !alt.login_hint.contains(['\n', '\r'])
                     });
                 if !valid {
-                    return Err(PackageError::Readiness { policy, reason: "a check runs python3 on a declared helper and requires python3; executables are bare names; alternatives reference owned credentials".into() });
+                    return Err(readiness_error(policy));
                 }
             }
         }
@@ -886,7 +907,9 @@ fn check_binding(
     let mut credential = None;
     for (key, value) in table {
         match key.as_str() {
-            "command" if runs_a_declared_helper(value, helpers) => transports += 1,
+            "command" if string_argv(value).is_some_and(|argv| runs_a_declared_helper(&argv, helpers)) => {
+                transports += 1;
+            }
             "builtin" if external.starts_with("sanitizers.") && names_a_stock_sanitizer(value) => {
                 transports += 1;
                 stock = true;
@@ -969,14 +992,15 @@ fn declares_selectors(value: &Value) -> bool {
 
 /// A battery ships the programs it runs, so an argv is exactly `python3` and one
 /// of the helpers this manifest declares.
-fn runs_a_declared_helper(command: &Value, helpers: &[RelativePath]) -> bool {
-    let Some(argv) = command.as_array() else {
-        return false;
-    };
-    match argv.iter().map(Value::as_str).collect::<Option<Vec<_>>>().as_deref() {
-        Some(["python3", helper]) => helpers.iter().any(|declared| declared.as_str() == *helper),
+fn runs_a_declared_helper(argv: &[&str], helpers: &[RelativePath]) -> bool {
+    match argv {
+        ["python3", helper] => helpers.iter().any(|declared| declared.as_str() == *helper),
         _ => false,
     }
+}
+
+fn string_argv(command: &Value) -> Option<Vec<&str>> {
+    command.as_array()?.iter().map(Value::as_str).collect()
 }
 
 /// The one deployment setting a fragment carries: `confined_results` naming
@@ -1334,6 +1358,70 @@ mod tests {
         validate_package(targeted_battery(MULTI_USER_POLICY, readiness).path()).unwrap();
     }
 
+    /// A target policy's check runs python3 on a declared helper, as the base's does,
+    /// under the base's declared requirements.
+    #[test]
+    fn a_target_policy_readiness_command_runs_a_declared_helper() {
+        let base_readiness = "\n[battery.readiness]\nrequired_executables = [\"python3\"]\n";
+        let directory = targeted_battery(MULTI_USER_POLICY, base_readiness);
+        let path = directory.path().join("appa-package.toml");
+        let with = |tail: &str, command: &str| format!("{BATTERY_MANIFEST}{tail}{BOTH_TARGETS}readiness = {command}\n");
+        fs::write(&path, with(base_readiness, "[\"python3\", \"audience-source.py\"]")).unwrap();
+        let package = validate_package(directory.path()).unwrap();
+        let Role::Battery(battery) = package.role else {
+            panic!("a battery")
+        };
+        assert_eq!(
+            battery.readiness_command(BatteryTarget::MultiUser),
+            ["python3", "audience-source.py"]
+        );
+
+        for invalid in [
+            with(base_readiness, "[\"python3\", \"check-multi-user.py\"]"),
+            with(base_readiness, "[\"sh\", \"audience-source.py\"]"),
+            with(base_readiness, "[\"python3\"]"),
+            with("", "[\"python3\", \"audience-source.py\"]"),
+            with(
+                "\n[battery.readiness]\nrequired_executables = [\"gh\"]\n",
+                "[\"python3\", \"audience-source.py\"]",
+            ),
+        ] {
+            fs::write(&path, &invalid).unwrap();
+            assert!(
+                matches!(validate_package(directory.path()), Err(PackageError::Readiness { .. })),
+                "{invalid}"
+            );
+        }
+    }
+
+    /// An empty target policy check is presence-only, as an empty base one is: it runs
+    /// nothing, so it needs neither python3 nor the base's check.
+    #[test]
+    fn an_empty_target_policy_readiness_command_runs_nothing() {
+        let directory = targeted_battery(MULTI_USER_POLICY, "");
+        let path = directory.path().join("appa-package.toml");
+        let with = |tail: &str| format!("{BATTERY_MANIFEST}{tail}{BOTH_TARGETS}readiness = []\n");
+        let base_check = "\n[battery.readiness]\ncommand = [\"python3\", \"audience-source.py\"]\n\
+             required_executables = [\"python3\"]\n";
+        for tail in [
+            "",
+            "\n[battery.readiness]\nrequired_executables = [\"gh\"]\n",
+            base_check,
+        ] {
+            fs::write(&path, with(tail)).unwrap();
+            let package = validate_package(directory.path()).unwrap_or_else(|error| panic!("{tail}: {error}"));
+            let Role::Battery(battery) = package.role else {
+                panic!("a battery")
+            };
+            assert!(battery.readiness_command(BatteryTarget::MultiUser).is_empty(), "{tail}");
+        }
+        let package = validate_package(directory.path()).unwrap();
+        assert_eq!(
+            package.battery().unwrap().readiness_command(BatteryTarget::SingleUser),
+            ["python3", "audience-source.py"]
+        );
+    }
+
     /// The loader refuses an external two included files both declare, and an
     /// included file at another policy version, so a target policy that cannot sit
     /// beside its base is refused here.
@@ -1557,6 +1645,11 @@ mod tests {
             "[externals.sanitizers.mask]\nbuiltin = \"llm\"\n",
             // A command beside a url is still a url binding on the wire.
             "[externals.audience.github]\ncommand = [\"python3\", \"audience-source.py\"]\n             url = \"https://elsewhere.example/audience\"\n",
+            // A command is exactly python3 on one of the manifest's helpers.
+            "[externals.audience.github]\ncommand = [\"python3\", \"check-multi-user.py\"]\n",
+            "[externals.audience.github]\ncommand = [\"sh\", \"audience-source.py\"]\n",
+            "[externals.audience.github]\ncommand = [\"python3\"]\n",
+            "[externals.audience.github]\ncommand = [\"python3\", 3]\n",
             // An external kind only a root config binds.
             "[externals.llm]\nprovider = \"anthropic\"\nmodel = \"claude-opus-5\"\n",
         ] {

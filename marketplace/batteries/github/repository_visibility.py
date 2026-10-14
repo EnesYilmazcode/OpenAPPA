@@ -55,7 +55,8 @@ spelling; the script refuses a consult whose mandate does not (exit
 status 2) before it reads a token.
 
 Credentials come from APPA_PROVIDER_GITHUB_TOKEN, else the GitHub CLI's
-login (see github_token.py); the API root is GITHUB_API_URL when set (a
+login (see github_token.py); a multi-user deployment runs
+repository-visibility-multi-user.py, which reads the variable alone; the API root is GITHUB_API_URL when set (a
 GitHub Enterprise Server's /api/v3), else api.github.com. A repository
 the token cannot see, or any GitHub error, exits nonzero: the runtime
 treats that as no answer and refuses the operation, so nothing is
@@ -66,41 +67,19 @@ from dataclasses import dataclass
 import json
 import os
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 
 # The sibling module is found beside this file however the file is loaded:
 # run by the runtime from its own directory, or imported by path from another.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from github_token import api_root, resolve_token  # noqa: E402
+from github_audience import rest_api  # noqa: E402
+from github_token import resolve_token  # noqa: E402
 
 
-API_ROOT = api_root(os.environ)
 CONTENT = "github.repository-visibility"
 READERS = "github.repository-readers"
-TIMEOUT_SECONDS = 30
 # create_or_update_file and push_files carry the file content inside the consult.
 MAX_INPUT_BYTES = 4 * 1024 * 1024
-
-
-def rest_api(token):
-    def call(path):
-        request = urllib.request.Request(
-            f"{API_ROOT}{path}",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-                return json.load(response)
-        except urllib.error.HTTPError as error:
-            raise RuntimeError(f"GET {path} failed: {error.code}") from error
-
-    return call
 
 
 def repository_of(consult):
@@ -338,22 +317,23 @@ def annotation(name, call, repository, owner, repo):
             raise ValueError(f"unexpected annotator name {name!r}")
 
 
-def main():
-    raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
-    if len(raw) > MAX_INPUT_BYTES:
-        raise ValueError("the consult is too large")
-    consult = json.loads(raw)
-    name, owner, repo, call = repository_of(consult)
-    check_declaration(consult, owner, repo)
-
-    repository = repository_facts(rest_api(resolve_token()), owner, repo)
-    json.dump({"version": 1, "answer": annotation(name, call, repository, owner, repo)}, sys.stdout)
-    sys.stdout.write("\n")
-
-
-if __name__ == "__main__":
+def main(token):
+    """Answers the consult on stdin with the token `token()` returns."""
     try:
-        main()
+        raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+        if len(raw) > MAX_INPUT_BYTES:
+            raise ValueError("the consult is too large")
+        consult = json.loads(raw)
+        name, owner, repo, call = repository_of(consult)
+        check_declaration(consult, owner, repo)
+
+        repository = repository_facts(rest_api(token()), owner, repo)
+        json.dump({"version": 1, "answer": annotation(name, call, repository, owner, repo)}, sys.stdout)
+        sys.stdout.write("\n")
     except Exception as error:
         print(f"github repository annotator: {error}", file=sys.stderr)
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main(resolve_token)
