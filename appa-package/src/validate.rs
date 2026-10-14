@@ -1,7 +1,7 @@
 //! The one coarse operation over a package directory: parse its manifest and
 //! refuse everything a marketplace package may not be.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -135,6 +135,16 @@ pub enum PackageError {
         contract: String,
         namespaces: String,
     },
+    #[error("{policy}: `audience.{name}` sends its member lookups to itself")]
+    AudienceLookupToItself { policy: PathBuf, name: String },
+    #[error(
+        "{policy}: `audience.{name}` sends its member lookups to `audience.{target}`, which sends its own elsewhere; a lookup takes one hop"
+    )]
+    ChainedAudienceLookup {
+        policy: PathBuf,
+        name: String,
+        target: String,
+    },
 }
 
 /// Read `<dir>/appa-package.toml` and refuse a package that is not
@@ -174,6 +184,9 @@ pub fn validate_package(dir: &Path) -> Result<Package, PackageError> {
                     field: "battery.policy",
                 });
             }
+            if battery.targets.is_none() {
+                check_lookup_routes(&policy, &base)?;
+            }
             if let Some(targets) = &mut battery.targets {
                 check_stands_alone(&policy, &base_document, &base.tools)?;
                 for target in BatteryTarget::ALL {
@@ -188,12 +201,18 @@ pub fn validate_package(dir: &Path) -> Result<Package, PackageError> {
                     if target_path.parent() != Some(contained.root.as_path()) {
                         return Err(PackageError::TargetedPolicyOutsidePackageRoot { field });
                     }
-                    let policy = target_path;
-                    let document = read_document(&policy)?;
-                    let bindings =
-                        check_policy(&policy, &package.name, &battery.namespaces, &battery.helpers, &document)?;
-                    check_composes(&policy, &base, &bindings)?;
-                    check_variants(&policy, &bindings.tools, &base.tools)?;
+                    let policy_path = target_path;
+                    let document = read_document(&policy_path)?;
+                    let bindings = check_policy(
+                        &policy_path,
+                        &package.name,
+                        &battery.namespaces,
+                        &battery.helpers,
+                        &document,
+                    )?;
+                    check_composes(&policy_path, &base, &bindings)?;
+                    check_variants(&policy_path, &bindings.tools, &base.tools)?;
+                    check_lookup_routes(&policy_path, &bindings)?;
                     target_policy.audiences = bindings.audiences;
                     target_policy.credentials = bindings.credentials;
                 }
@@ -391,6 +410,14 @@ fn check_policy(
         .and_then(Value::as_table)
         .map(|bindings| bindings.keys().cloned().collect())
         .unwrap_or_default();
+    let lookups = document
+        .get("externals")
+        .and_then(|externals| externals.get("audience"))
+        .and_then(Value::as_table)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, binding)| Some((name.clone(), binding.get("lookup")?.as_str()?.to_owned())))
+        .collect();
 
     // A contract may carry an argument filter — `mcp/ns/send(channel:C1)` — so
     // the check is on the family and namespace it opens with, not on the whole
@@ -417,6 +444,7 @@ fn check_policy(
     Ok(PolicyBindings {
         version,
         audiences,
+        lookups,
         credentials,
         externals: externals(document).map(|(external, _)| external).collect(),
         tools,
@@ -595,6 +623,8 @@ fn check_variants(policy: &Path, tools: &[String], base: &[String]) -> Result<()
 struct PolicyBindings {
     version: i64,
     audiences: Vec<String>,
+    /// Each audience binding that routes its member lookups, to the entry it names.
+    lookups: BTreeMap<String, String>,
     credentials: Vec<String>,
     externals: BTreeSet<NamedExternal>,
     /// The declared tool contracts, canonical and in declaration order.
@@ -722,6 +752,33 @@ fn check_composes(policy: &Path, base: &PolicyBindings, target_policy: &PolicyBi
         }),
         None => Ok(()),
     }
+}
+
+/// The loader follows a lookup route one hop: it refuses a route whose destination
+/// routes its own lookups. A targeted base binds no command-bearing audience, so
+/// every route and every destination it may chain to live in one policy; a
+/// destination it does not bind is the root's, which the loader checks against the
+/// composed config.
+fn check_lookup_routes(policy: &Path, bindings: &PolicyBindings) -> Result<(), PackageError> {
+    for (name, target) in &bindings.lookups {
+        match (name == target, bindings.lookups.contains_key(target)) {
+            (true, _) => {
+                return Err(PackageError::AudienceLookupToItself {
+                    policy: policy.to_path_buf(),
+                    name: name.clone(),
+                });
+            }
+            (false, true) => {
+                return Err(PackageError::ChainedAudienceLookup {
+                    policy: policy.to_path_buf(),
+                    name: name.clone(),
+                    target: target.clone(),
+                });
+            }
+            (false, false) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Returns the credential variables the bindings name, each once, in name order.
@@ -853,6 +910,10 @@ fn check_binding(
             // An audience source declares the selector templates it serves
             // beside its binding; the loader parses the templates themselves.
             "selectors" if external.starts_with("audience.") && declares_selectors(value) => {}
+            // An audience source may send its member lookups to another
+            // audience entry; the loader resolves the name in the composed config.
+            "lookup"
+                if external.starts_with("audience.") && value.as_str().is_some_and(|target| !target.is_empty()) => {}
             _ => return Err(refuse()),
         }
     }
@@ -1509,6 +1570,62 @@ mod tests {
                 "accepted {replacement}"
             );
         }
+    }
+
+    /// An audience source may route its member lookups to another audience
+    /// entry by name; no other external, and no other value, carries one.
+    #[test]
+    fn an_audience_binding_may_route_its_lookups() {
+        let binding = "[externals.audience.github]\ncommand = [\"python3\", \"audience-source.py\"]\n";
+        let routed = BATTERY_POLICY.replace(binding, &format!("{binding}lookup = \"readers\"\n"));
+        assert!(validate_package(battery(&routed).path()).is_ok());
+
+        for refused in [
+            BATTERY_POLICY.replace(binding, &format!("{binding}lookup = \"\"\n")),
+            BATTERY_POLICY.replace(binding, &format!("{binding}lookup = 3\n")),
+            format!(
+                "{BATTERY_POLICY}\n[[policy.sanitizer]]\nname = \"mask\"\non = [\"tool_output\"]\n\n\
+                 [externals.sanitizers.mask]\nbuiltin = \"redact-secrets\"\nlookup = \"readers\"\n"
+            ),
+        ] {
+            assert!(
+                matches!(
+                    validate_package(battery(&refused).path()),
+                    Err(PackageError::PolicyExternalCommand { .. })
+                ),
+                "accepted {refused}"
+            );
+        }
+    }
+
+    /// A route the loader would refuse at every deployment is refused here: one to
+    /// itself, and one to an entry the package binds that routes its own lookups.
+    /// A destination the package does not bind is the root's to supply.
+    #[test]
+    fn a_lookup_route_takes_one_hop() {
+        let binding = "[externals.audience.github]\ncommand = [\"python3\", \"audience-source.py\"]\n";
+        let relay = "[externals.audience.relay]\ncommand = [\"python3\", \"audience-source.py\"]\n\
+             selectors = [{ template = \"team/<team>\" }]\n";
+        let routed = |to: &str| BATTERY_POLICY.replace(binding, &format!("{binding}lookup = \"{to}\"\n"));
+
+        assert!(matches!(
+            validate_package(battery(&routed("github")).path()),
+            Err(PackageError::AudienceLookupToItself { name, .. }) if name == "github"
+        ));
+        assert!(matches!(
+            validate_package(battery(&format!("{}{relay}lookup = \"host-members\"\n", routed("relay"))).path()),
+            Err(PackageError::ChainedAudienceLookup { name, target, .. }) if name == "github" && target == "relay"
+        ));
+        assert!(validate_package(battery(&format!("{}{relay}", routed("relay"))).path()).is_ok());
+
+        let target_policy = |lookup: &str| format!("{MULTI_USER_POLICY}lookup = \"{lookup}\"\n");
+        let directory = targeted_battery(&target_policy("host-members"), "");
+        assert!(validate_package(directory.path()).is_ok());
+        fs::write(directory.path().join("multi-user.toml"), target_policy("github-org")).unwrap();
+        assert!(matches!(
+            validate_package(directory.path()),
+            Err(PackageError::AudienceLookupToItself { name, .. }) if name == "github-org"
+        ));
     }
 
     #[test]
