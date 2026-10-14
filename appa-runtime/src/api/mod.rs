@@ -1815,6 +1815,7 @@ impl Runtime {
         &self,
         id: TrajectoryId,
         inventory: appa_runtime_api::inventory::ToolInventory,
+        principal: Option<ReaderId>,
     ) -> Result<Session, EventError> {
         let config = self
             .inner
@@ -1829,7 +1830,7 @@ impl Runtime {
             self.inner.shared.naming,
         )
         .map_err(|error| EventError::PolicyUnavailable(error.to_string()))?;
-        self.create_session_under(id, Arc::new(deployment), None)
+        self.create_session_under(id, Arc::new(deployment), principal)
     }
 
     /// Reserve identities in the actor's own scope, independently of the immutable
@@ -4070,7 +4071,7 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             let runtime = Runtime::open(with_pool(2), dir.path().join("appa.db"), None).expect("the deployment opens");
             let session = |id: &str| {
                 runtime
-                    .create_session_with_inventory(TrajectoryId(id.to_string()), ToolInventory::default())
+                    .create_session_with_inventory(TrajectoryId(id.to_string()), ToolInventory::default(), None)
                     .expect("the inventory session opens")
             };
             let (first, second) = (session("first"), session("second"));
@@ -4495,7 +4496,9 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             }],
             ..ToolInventory::default()
         };
-        runtime.create_session_with_inventory(id.clone(), inventory).unwrap();
+        runtime
+            .create_session_with_inventory(id.clone(), inventory, None)
+            .unwrap();
         runtime
             .reload(claude_config(
                 "[policy]\nversion = 2\n[[policy.tool]]\nname = \"other\"\n",
@@ -4703,7 +4706,7 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             sources: Vec::new(),
         };
         runtime
-            .create_session_with_inventory(root.clone(), inventory("parent"))
+            .create_session_with_inventory(root.clone(), inventory("parent"), None)
             .unwrap();
         let child = Actor {
             root: root.clone(),
@@ -4778,7 +4781,11 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             }],
             ..ToolInventory::default()
         };
-        assert!(runtime.create_session_with_inventory(id.clone(), inventory).is_err());
+        assert!(
+            runtime
+                .create_session_with_inventory(id.clone(), inventory, None)
+                .is_err()
+        );
         assert!(matches!(runtime.session(&id, &id), Err(EventError::UnknownTrajectory)));
     }
 
@@ -4801,7 +4808,13 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             "protocol": 1, "adapter": "kagent", "event": "session_start", "root_id": "late",
             "inventory": { "tools": [], "sources": [{"server": "demo", "status": "unavailable", "dynamic": true}] }
         });
-        let (status, response) = crate::hooks::answer(&runtime, &adapter, &serde_json::to_vec(&opening).unwrap()).await;
+        let (status, response) = crate::hooks::answer(
+            &runtime,
+            &adapter,
+            appa_runtime_api::PrincipalSource::None,
+            &serde_json::to_vec(&opening).unwrap(),
+        )
+        .await;
         assert_eq!(status, 200, "{response}");
         let call = serde_json::json!({
             "protocol": 1, "adapter": "kagent", "event": "tool_call", "root_id": "late",
@@ -4811,7 +4824,13 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 "sources": [{"server": "demo", "status": "complete", "dynamic": true}]
             }
         });
-        let (status, response) = crate::hooks::answer(&runtime, &adapter, &serde_json::to_vec(&call).unwrap()).await;
+        let (status, response) = crate::hooks::answer(
+            &runtime,
+            &adapter,
+            appa_runtime_api::PrincipalSource::None,
+            &serde_json::to_vec(&call).unwrap(),
+        )
+        .await;
         assert_eq!(status, 200, "{response}");
         let decision = serde_json::from_value::<appa_runtime_api::WireDecision>(response)
             .unwrap()
@@ -4819,7 +4838,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             .unwrap();
         assert!(matches!(decision, appa_runtime_api::HookDecision::AllowCall { .. }));
         let result = br#"{"protocol":1,"adapter":"kagent","event":"tool_result","root_id":"late","tool":"mcp:demo/read_secret","arguments":{},"outcome":{"status":"success","body":{ "literal" : "mcp:demo/read_secret" }}}"#;
-        let (status, response) = crate::hooks::answer(&runtime, &adapter, result).await;
+        let (status, response) =
+            crate::hooks::answer(&runtime, &adapter, appa_runtime_api::PrincipalSource::None, result).await;
         assert_eq!(status, 200, "{response}");
         assert_eq!(response["decision"], "ack", "unchanged output stays with the host");
         let root = TrajectoryId("kagent:late".into());
@@ -4856,6 +4876,7 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             let (status, response) = crate::hooks::answer(
                 runtime,
                 &appa_adapter_kagent::adapter(),
+                appa_runtime_api::PrincipalSource::None,
                 &serde_json::to_vec(&event).unwrap(),
             )
             .await;
