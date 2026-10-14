@@ -44,7 +44,7 @@ digest = "sha256:2004ed3ba8f6689416ecb07fc4a6a09187bde26ef26cf1131c4a308e538e63d
 
 [packages.battery.linear]
 path = "batteries/linear"
-digest = "sha256:c8012c76e1145e84059c805da8c6dedeff242a680a88fd9c27a79b42665ddcdf"
+digest = "sha256:311bb46544f752f21f2758b448aac645f96b99af7591ca91b02e6d6dfcb75eb0"
 
 [packages.battery.microsoft-learn]
 path = "batteries/microsoft-learn"
