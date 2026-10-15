@@ -1011,6 +1011,8 @@ impl Prepared {
                 }),
                 store,
                 recorder: None,
+                #[cfg(feature = "archestra")]
+                archestra_context: None,
                 pinned: None,
             }),
         }
@@ -1022,6 +1024,8 @@ struct Inner {
     store: Arc<LogStore>,
     /// Where this view's sessions hand a record of every consult they make.
     recorder: Option<Arc<dyn ConsultRecorder>>,
+    #[cfg(feature = "archestra")]
+    archestra_context: Option<String>,
     /// The deployment this view serves in place of the shared one; see [`Runtime::pinned`].
     pinned: Option<Arc<Deployment>>,
 }
@@ -1113,6 +1117,13 @@ impl Runtime {
         self.view(|view| view.recorder = Some(recorder))
     }
 
+    /// A request-scoped opaque context returned only to the host's archestra
+    /// endpoint. It is never part of a consult artifact, record, or trajectory.
+    #[cfg(feature = "archestra")]
+    pub fn with_archestra_context(&self, context: String) -> Runtime {
+        self.view(|view| view.archestra_context = Some(context))
+    }
+
     /// This view serving `deployment` instead of the runtime's serving one: every root it
     /// opens, event it decides and consult it makes reads this deployment, whatever a
     /// concurrent [`Runtime::install`] swaps in. A host that serves many policies from one
@@ -1147,6 +1158,8 @@ impl Runtime {
             shared: Arc::clone(&self.inner.shared),
             store: Arc::clone(&self.inner.store),
             recorder: self.inner.recorder.clone(),
+            #[cfg(feature = "archestra")]
+            archestra_context: self.inner.archestra_context.clone(),
             pinned: self.inner.pinned.clone(),
         };
         vary(&mut inner);
