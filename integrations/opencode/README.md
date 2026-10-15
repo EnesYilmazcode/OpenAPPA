@@ -5,7 +5,78 @@ returns through APPA's runtime. It targets `@opencode/cli` and
 `@opencode/plugin` 2.0.28. It does not support
 OpenCode V1's `@opencode-ai/plugin` API.
 
-## Install from this checkout
+## Install
+
+Install OpenCode V2 2.0.28 and the released `appa` executable. No OpenAPPA
+checkout, Rust compiler, Bun installation, or plugin dependency install is required.
+
+```sh
+curl -fsSL https://openappa.com/install.sh | sh
+~/.local/bin/appa plugin install opencode
+```
+
+The command retains the verified JavaScript plugin, batteries, and matching
+runtime. It merges the plugin, MCP connection, and `/appa-guide` command into
+your global OpenCode JSON settings. It starts the loopback runtime and verifies
+its binary, deployment, and policy. Existing policy and unrelated settings remain
+unchanged. Global JSONC and conflicting APPA-owned names are refused, not overwritten.
+
+From the project whose tools you want to configure, run:
+
+```sh
+appa opencode setup
+```
+
+This opens a private operator session with your merged global and project-local
+tool inventory. Only `appa_setup` reaches the setup model. Review the proposed
+policy before approving publication. Close setup, run `appa plugin install opencode`
+to reload the protected runtime, then start a fresh coding session. The same
+install command starts the runtime after a reboot; no separate service is required.
+
+Installation is user-global. Settings default to `~/.config/opencode/opencode.json`;
+policy and runtime data use `~/.config/appa/opencode/`. Both respect `XDG_CONFIG_HOME`;
+`OPENCODE_CONFIG_DIR` overrides the OpenCode settings directory. `--config` selects
+another policy. Setup defaults to the current directory; optional `--project`
+selects another project's inventory, not an installation scope.
+
+Keep the deployment outside the agent's writable project. Never expose the runtime
+through a public listener or portal. Its `/hook` endpoint trusts its local client.
+
+`appa plugin remove opencode` removes only unchanged installer-owned registration.
+It preserves edited entries, policies, retained artifacts, data, and the running runtime.
+For offline installation, export with `appa bundle --config <policy> --output <archive>`
+and restore with `appa plugin install opencode --from <archive> --sha256 <trusted-digest>`.
+
+## Release payload
+
+`marketplace/plugins/opencode` contains the generated JavaScript plugin and its
+setup documentation. OpenCode V2 2.0.28 loads that directory directly through
+`index.js`; `package.json` also exports that entry point. The operator needs
+no Bun/npm install or source checkout.
+The bundle includes `@opencode/schema`. OpenCode supplies the public `effect`
+and `@opencode/plugin` imports. The source setup launcher is excluded from the
+bundle; importing the plugin does not register settings or start setup.
+
+Maintainers regenerate and check the committed payload with Bun 1.3.10:
+
+```sh
+(cd integrations/opencode && bun install --frozen-lockfile && bun run check)
+bun scripts/appa-opencode-package.ts
+bun scripts/appa-opencode-package.ts --check
+```
+
+The installer copies `default.appa.toml` into a new deployment and retains
+deployment-relative `batteries/<name>/appa.toml` includes. In the private setup
+session, it sets `APPA_OPENCODE_BATTERIES` to the absolute retained marketplace
+`batteries` directory. The setup catalog lists all batteries declaring the
+`opencode` host, not just batteries already installed in the deployment.
+Publication still validates includes relative to the deployment config.
+The installer materializes the version's batteries there before setup.
+It sets `APPA_OPENCODE_SETUP_CONFIG` and `APPA_OPENCODE_SETUP_BINARY` only for the
+operator's private setup session. The loaded plugin reads its guide and
+contracts from its own shipped directory.
+
+## Developer installation from this checkout
 
 Build APPA and install the plugin's locked dependencies:
 
@@ -334,16 +405,15 @@ channels. No inference-policy enforcement is claimed.
 
 ### Published CLI smoke check
 
-The CLI smoke check runs separately from `bun test`. Its CLI installation does
-not add dependencies or execution time to the SDK test lane. Build APPA and
-install the plugin dependencies as above, then run:
+The CLI smoke check runs separately from `bun test`. It loads the committed
+marketplace bundle, not the TypeScript source. Build APPA, then run:
 
 ```sh
 (cd integrations/opencode/smoke && bun install --frozen-lockfile)
 python3 integrations/opencode/smoke/run.py
 ```
 
-The check uses the published CLI and plugin SDK at the same pinned version.
+The check uses the published CLI and host plugin SDK at the same pinned version.
 A local OpenAI-compatible SSE fixture scripts tool proposals. No model provider
 credentials, external inference, or paid tokens are used. Native OpenCode tools,
 APPA decisions, and MCP remedy execution are real.
