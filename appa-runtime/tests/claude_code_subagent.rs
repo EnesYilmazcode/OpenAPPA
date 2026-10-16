@@ -1,5 +1,5 @@
 mod common;
-use common::{claude_event, claude_hook, offers, repo_root};
+use common::{claude_event, claude_hook, including_session_tool_rules, offers, repo_root};
 
 use std::path::Path;
 
@@ -148,7 +148,7 @@ fn deployment(policy_extra: &str, externals_extra: &str, bash_delta: &str) -> Ru
     );
     let dir = tempfile::tempdir().expect("a temp dir is creatable");
     let path = dir.path().join("appa.toml");
-    std::fs::write(&path, text).expect("the deployment writes");
+    std::fs::write(&path, including_session_tool_rules(dir.path(), &text)).expect("the deployment writes");
     let config = Config::load(&path).expect("the deployment loads");
     Runtime::open(config, dir.path().join("appa.db"), None).expect("the deployment opens")
 }
