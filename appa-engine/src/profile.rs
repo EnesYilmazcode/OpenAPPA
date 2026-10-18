@@ -3,6 +3,7 @@
 //! policy identity.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -239,19 +240,52 @@ pub fn neutral_starting_label(chain: &TrustChain) -> Label {
     Label::new(top, crate::label::Audience::public())
 }
 
-/// The version of the policy configuration dialect a policy file was written in, carried on the
-/// durable opening record. Never part of the policy identity: normalization already
-/// erases source syntax.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PolicyDialectVersion(u32);
+/// Where one policy stands in its deployment's sequence. A deployment's first published policy
+/// is revision 1, and every publish moves the head to the next revision. A family log stamps each
+/// batch with the revision that decided it, and replay judges the batch under that revision's
+/// policy, so a later publish never changes what an earlier record meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PolicyRevision(NonZeroU64);
 
-impl PolicyDialectVersion {
-    pub const fn new(version: u32) -> Self {
-        PolicyDialectVersion(version)
+impl PolicyRevision {
+    pub const FIRST: PolicyRevision = PolicyRevision::new(1);
+
+    /// Construct a positive revision supplied by a validated caller.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `revision` is zero. Storage reads validate before calling this constructor.
+    pub const fn new(revision: u64) -> Self {
+        match NonZeroU64::new(revision) {
+            Some(revision) => PolicyRevision(revision),
+            None => panic!("a policy revision is positive"),
+        }
     }
 
-    pub const fn value(self) -> u32 {
-        self.0
+    pub const fn value(self) -> u64 {
+        self.0.get()
+    }
+
+    /// The revision a publish over this one produces.
+    ///
+    /// Publishes advance stored heads, which are positive SQL `bigint` values. Their successor
+    /// fits in `u64`; a successor beyond SQL's range is refused by the store's positive constraint.
+    ///
+    /// # Panics
+    ///
+    /// Panics at `u64::MAX`, which no stored head can contain.
+    pub const fn next(self) -> Self {
+        match self.value().checked_add(1) {
+            Some(revision) => PolicyRevision::new(revision),
+            None => panic!("a stored policy revision is below u64::MAX"),
+        }
+    }
+}
+
+impl std::fmt::Display for PolicyRevision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -265,6 +299,48 @@ pub struct DeploymentPolicy {
     pub planner_cap: PlannerCap,
     pub dialect: PolicyDialectVersion,
     pub profile: ProfileDeclaration,
+}
+
+/// The version of the policy configuration dialect a policy file was written in, carried on the
+/// durable opening record. Never part of the policy identity: normalization already erases source
+/// syntax.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDialectVersion(u32);
+
+impl PolicyDialectVersion {
+    pub const fn new(version: u32) -> Self {
+        PolicyDialectVersion(version)
+    }
+
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
+
+/// The name of a deployment: a policy line that advances through policy revisions. A standalone
+/// runtime serves one; an embedding host serves one per tenant. A family that follows a line names
+/// it on its opening record.
+///
+/// This is an opaque host identifier, compared byte for byte and stored unchanged. It has no
+/// policy syntax or display-name constraints; the host chooses identifiers suitable for its UI.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeploymentName(String);
+
+impl DeploymentName {
+    pub fn new(name: impl Into<String>) -> DeploymentName {
+        DeploymentName(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DeploymentName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// The key of a stored policy file: the SHA-256 of its exact bytes, lowercase hex.
@@ -283,18 +359,14 @@ impl PolicyFileKey {
     }
 }
 
-/// The policy identity a durable opening records: a domain-separated SHA-256 digest over the
-/// RFC 8785 canonical bytes of the identity document — the normalized engine-visible policy and
-/// deployment declaration. The document is field-aware: it names every included field explicitly,
-/// preserves the semantic sequences (the trust chain's rank order, authority registration order),
-/// sorts true maps and sets, and excludes source syntax, runtime bindings, `[limits]`, and hints.
-///
-/// The domain tag names the identity algorithm, and an opening records the digest the algorithm
-/// of the engine that opened it gave its policy. [`PolicyIdentity::of_registry`] computes the
-/// current algorithm. An engine also recognizes what [`PolicyIdentity::earlier_of_registry`]
-/// computes, so a trajectory an earlier engine opened still reopens under the same policy after
-/// the identity document changes. A change to the identity document keeps the replaced algorithm
-/// there. Drop an earlier algorithm only once no host keeps a trajectory that it opened.
+/// The policy identity: a domain-separated SHA-256 digest over the RFC 8785 canonical bytes of
+/// the identity document — the normalized engine-visible policy and deployment declaration. The
+/// document is field-aware: it names every included field explicitly, preserves the semantic
+/// sequences (the trust chain's rank order, authority registration order), sorts true maps and
+/// sets, and excludes source syntax, runtime bindings, `[limits]`, and hints. Two policy files
+/// with one identity decide every call alike. A family's opening record carries the identity of
+/// the policy it opened under, and an engine reopens the family only while it recognises that
+/// digest ([`crate::engine::Engine::recognizes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyIdentity(#[serde(with = "crate::hex32")] [u8; 32]);
 
@@ -654,6 +726,8 @@ pub(crate) fn opening_at(trajectory: crate::value::TrajectoryId, starting_label:
         profile,
         policy_file_key: PolicyFileKey::of(b"fixture"),
         open_vectors: Vec::new(),
+        deployment: None,
+        revision: None,
         forked_from: None,
         principal: None,
     })
@@ -692,6 +766,15 @@ mod tests {
     use crate::label::DeclaredAudience;
     use crate::label::{Audience, ReaderId};
     use crate::names::{AnnotatorName, AuthorityName, SanitizerName, TagName};
+
+    #[test]
+    fn a_policy_revision_refuses_zero_in_external_data() {
+        assert!(serde_json::from_str::<PolicyRevision>("0").is_err());
+        assert!(serde_json::from_str::<PolicyRevision>("-1").is_err());
+        let revision: PolicyRevision = serde_json::from_str("1").unwrap();
+        assert_eq!(revision, PolicyRevision::FIRST);
+        assert_eq!(serde_json::to_string(&revision).unwrap(), "1");
+    }
 
     fn chain() -> TrustChain {
         TrustChain::new(vec!["suspicious".into(), "trusted".into()])
@@ -1425,47 +1508,6 @@ mod tests {
             identity(&explicit, &covering_profile(&explicit)),
             identity(&with_group, &covering_profile(&with_group))
         );
-    }
-
-    /// v1 is the current document without `forwards`. A policy that forwards nothing has one
-    /// v1 identity, which moves with every other edit; a policy that declares `forwards` has
-    /// none, since no v1 engine compiled such a policy.
-    #[test]
-    fn the_v1_identity_covers_every_field_but_forwards() {
-        let earlier = |cfg: &RegistryConfig| {
-            let built = crate::registry::Registry::build(
-                cfg.clone(),
-                crate::registry::PlannerCap::default(),
-                covering_profile(cfg),
-            )
-            .expect("a fixture configuration builds");
-            PolicyIdentity::earlier_of_registry(&built)
-        };
-        let cfg = config(vec![tool("fetch")]);
-        let [v1] = earlier(&cfg)[..] else {
-            panic!("a policy that forwards nothing has one v1 identity")
-        };
-        assert_ne!(v1, identity(&cfg, &covering_profile(&cfg)));
-
-        let delta_edit = config(vec![{
-            let mut t = tool("fetch");
-            t.delta = Delta {
-                trust: Some(Trust::new(0)),
-                audience: None,
-            };
-            t
-        }]);
-        assert_ne!(earlier(&delta_edit), vec![v1], "v1 still covers delta");
-
-        let forwards_edit = config(vec![{
-            let mut t = tool("fetch");
-            t.forwards = Delta {
-                trust: Some(Trust::new(0)),
-                audience: None,
-            };
-            t
-        }]);
-        assert_eq!(earlier(&forwards_edit), vec![], "no v1 policy declares forwards");
     }
 
     #[test]
