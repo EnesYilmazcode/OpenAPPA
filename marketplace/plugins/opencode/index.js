@@ -1232,6 +1232,7 @@ var REFUSAL_CLASSES = [
   "untrusted_log",
   "policy_unavailable",
   "policy_moved",
+  "legacy_family",
   "inventory_refused",
   "engine_invariant",
   "contended",
@@ -1372,7 +1373,7 @@ ${stdout}`);
             state: "saved",
             description,
             inventory: inventory2,
-            next: "Close setup. Restart the protected runtime and start a fresh OpenCode session. Existing sessions retain their opening policy."
+            next: "Close setup. Restart the protected runtime and start a fresh OpenCode session. Existing sessions use the saved policy for their next tool call."
           });
         } finally {
           publishing = !1, await rm(candidate, { force: !0 });

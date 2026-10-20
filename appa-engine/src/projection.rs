@@ -132,8 +132,6 @@ struct ReturnedChild {
 pub struct Projection {
     /// How many batches the family log held when this was folded.
     position: u64,
-    /// The policy revision that opened the family, where it follows a deployment.
-    opening_revision: Option<crate::profile::PolicyRevision>,
     values: Vector<AdmittedValue>,
     local: OrdMap<TrajectoryId, Vector<ValueId>>,
     /// The meet of every label in `local`, met with only terms the trajectory's live fold also
@@ -203,12 +201,11 @@ pub struct Projection {
 /// The call a [`Fact::DispatchOpened`] record dispatched, rebuilt from its fields.
 pub(crate) fn opened_call(
     tool: &ToolName,
-    declaration: crate::value::ToolDeclarationId,
     arguments: &crate::params::CanonicalArguments,
     annotation: &Option<PinnedAnnotation>,
     file_basis: &Option<crate::value::FileBasis>,
 ) -> ResolvedCall {
-    ResolvedCall::new_keyed(tool.clone(), declaration, arguments.clone())
+    ResolvedCall::new(tool.clone(), arguments.clone())
         .with_annotation(annotation.clone())
         .with_file_basis(file_basis.clone())
 }
@@ -277,7 +274,6 @@ impl Projection {
     pub(crate) fn empty(position: u64) -> Self {
         Projection {
             position,
-            opening_revision: None,
             values: Default::default(),
             local: Default::default(),
             local_label: Default::default(),
@@ -405,7 +401,6 @@ impl Projection {
     pub(crate) fn fold(&mut self, fact: &Fact) {
         let Projection {
             position: _,
-            opening_revision,
             values,
             local,
             local_label,
@@ -447,12 +442,10 @@ impl Projection {
             Fact::TrajectoryOpened(crate::fact::TrajectoryOpening {
                 trajectory,
                 profile,
-                revision,
                 forked_from,
                 principal: opened_for,
                 ..
             }) => {
-                *opening_revision = *revision;
                 let mut starting = profile.starting_label().clone();
                 // A root opened as a fork starts where its parent stood: the parent's label
                 // folds into the base every later admission folds onto, and the parent
@@ -605,7 +598,6 @@ impl Projection {
                 trajectory,
                 dispatch,
                 tool,
-                declaration,
                 arguments,
                 receiving,
                 proposed_effects,
@@ -616,13 +608,8 @@ impl Projection {
                 terms,
                 proposed_label: _,
             } => {
-                if let Some(terms) = terms {
-                    release_terms.insert(dispatch.clone(), (terms.clone(), proposed_effects.clone()));
-                }
-                dispatch_calls.insert(
-                    dispatch.clone(),
-                    opened_call(tool, *declaration, arguments, annotation, file_basis),
-                );
+                release_terms.insert(dispatch.clone(), (terms.clone(), proposed_effects.clone()));
+                dispatch_calls.insert(dispatch.clone(), opened_call(tool, arguments, annotation, file_basis));
                 receiving_bounds.insert(dispatch.clone(), receiving.clone());
                 dispatch_evidence.insert(dispatch.clone(), evidence.clone());
                 subject_dispatches.insert(subject.clone(), dispatch.clone());
@@ -782,11 +769,6 @@ impl Projection {
 
     pub(crate) fn position(&self) -> u64 {
         self.position
-    }
-
-    /// The revision that opened the family, or `None` for a family pinned to a policy snapshot.
-    pub(crate) fn opening_revision(&self) -> Option<crate::profile::PolicyRevision> {
-        self.opening_revision
     }
 
     fn value(&self, id: ValueId) -> Option<&AdmittedValue> {
@@ -1010,7 +992,7 @@ impl Views<'_> {
         let digest = call.digest();
         let mut pins = offered
             .chain(approved)
-            .filter(|standing| standing.digest() == digest && standing.declaration_id() == call.declaration_id())
+            .filter(|standing| standing.digest() == digest)
             .filter_map(ResolvedCall::annotation);
         let first = pins.next()?;
         pins.all(|pin| pin == first).then_some(first)
@@ -1447,8 +1429,8 @@ impl Views<'_> {
         self.projection.bound_sanitizers.get(dispatch)
     }
 
-    /// The terms this dispatch's release pinned and the effects it reserved, where its
-    /// `DispatchOpened` carries them.
+    /// The terms this dispatch's release pinned and the effects it reserved; `None` for a
+    /// dispatch the family never opened.
     pub(crate) fn release_terms(&self, dispatch: &DispatchId) -> Option<&(crate::fact::ReleaseTerms, EffectSet)> {
         self.projection.release_terms.get(dispatch)
     }
@@ -1769,7 +1751,6 @@ mod tests {
                 trajectory: traj("a"),
                 dispatch: dispatch("a"),
                 tool: ToolName::new("tool"),
-                declaration: Default::default(),
                 arguments: crate::params::test_arguments(&json!({ "t": "a" })),
                 proposed_label: Label::top(),
                 receiving: Label::top(),
@@ -1778,7 +1759,7 @@ mod tests {
                 file_basis: None,
                 subject: crate::basis::fixture_subject(&traj("a")),
                 evidence: crate::audience::AudienceEvidence::default(),
-                terms: None,
+                terms: crate::fact::ReleaseTerms::none(),
             },
             Fact::DispatchClosed {
                 trajectory: traj("a"),
@@ -1801,7 +1782,6 @@ mod tests {
                 trajectory: traj("a"),
                 dispatch: dispatch("a"),
                 tool: ToolName::new("tool"),
-                declaration: Default::default(),
                 arguments: crate::params::test_arguments(&json!({ "t": "a" })),
                 proposed_label: Label::top(),
                 receiving: Label::top(),
@@ -1810,7 +1790,7 @@ mod tests {
                 file_basis: None,
                 subject: crate::basis::fixture_subject(&traj("a")),
                 evidence: crate::audience::AudienceEvidence::default(),
-                terms: None,
+                terms: crate::fact::ReleaseTerms::none(),
             },
             Fact::DispatchClosed {
                 trajectory: traj("a"),
@@ -1832,7 +1812,6 @@ mod tests {
                 trajectory: traj("a"),
                 dispatch: dispatch("a"),
                 tool: ToolName::new("tool"),
-                declaration: Default::default(),
                 arguments: crate::params::test_arguments(&json!({ "t": "a" })),
                 proposed_label: Label::top(),
                 receiving: Label::top(),
@@ -1841,7 +1820,7 @@ mod tests {
                 file_basis: None,
                 subject: crate::basis::fixture_subject(&traj("a")),
                 evidence: crate::audience::AudienceEvidence::default(),
-                terms: None,
+                terms: crate::fact::ReleaseTerms::none(),
             },
             Fact::DispatchClosed {
                 trajectory: traj("a"),
@@ -1942,7 +1921,6 @@ mod tests {
                 trajectory: traj("a"),
                 dispatch: dispatch("a"),
                 tool: ToolName::new("fetch_meeting"),
-                declaration: Default::default(),
                 arguments: crate::params::test_arguments(&json!({ "t": "a" })),
                 proposed_label: Label::top(),
                 receiving: Label::top(),
@@ -1951,7 +1929,7 @@ mod tests {
                 file_basis: None,
                 subject: crate::basis::fixture_subject(&traj("a")),
                 evidence: crate::audience::AudienceEvidence::default(),
-                terms: None,
+                terms: crate::fact::ReleaseTerms::none(),
             },
             Fact::ValueAdmitted {
                 trajectory: traj("a"),
